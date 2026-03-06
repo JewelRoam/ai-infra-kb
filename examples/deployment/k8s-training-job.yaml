@@ -1,0 +1,299 @@
+# Kubernetes 分布式训练任务配置
+# 用于大规模分布式训练
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: distributed-training
+  namespace: ai-training
+  labels:
+    app: training
+    model: llm-finetune
+spec:
+  # 任务配置
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 3600  # 完成后保留1小时
+  
+  # Pod 模板
+  template:
+    metadata:
+      labels:
+        app: training
+    spec:
+      # 服务账户
+      serviceAccountName: training-sa
+      
+      # 优先级
+      priorityClassName: high-priority
+      
+      # Pod 超时
+      activeDeadlineSeconds: 86400  # 24小时
+      
+      # 重启策略
+      restartPolicy: OnFailure
+      
+      # 容忍度（允许调度到 GPU 节点）
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+      
+      # 节点选择器
+      nodeSelector:
+        node-type: gpu
+      
+      # 亲和性
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: nvidia.com/gpu.present
+                operator: In
+                values:
+                - "true"
+        podAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - training
+              topologyKey: kubernetes.io/hostname
+      
+      # Init 容器
+      initContainers:
+      - name: init-data
+        image: busybox:latest
+        command: ['sh', '-c', 'echo "Initializing..." && sleep 5']
+        volumeMounts:
+        - name: data-volume
+          mountPath: /data
+      
+      # 主容器
+      containers:
+      - name: trainer
+        image: ai-training:v1.0
+        imagePullPolicy: Always
+        
+        # 启动命令
+        command:
+        - /bin/bash
+        - -c
+        - |
+          # 设置分布式环境
+          export MASTER_ADDR=$(head -1 /etc/hosts | awk '{print $1}')
+          export MASTER_PORT=29500
+          export WORLD_SIZE=$(wc -l < /etc/hosts)
+          export RANK=$(grep -n "$(hostname)" /etc/hosts | cut -d: -f1)
+          export LOCAL_RANK=0
+          
+          echo "Starting distributed training..."
+          echo "Master: ${MASTER_ADDR}:${MASTER_PORT}"
+          echo "World size: ${WORLD_SIZE}, Rank: ${RANK}"
+          
+          # 启动训练
+          torchrun \
+            --nnodes=${WORLD_SIZE} \
+            --nproc_per_node=8 \
+            --node_rank=$((RANK-1)) \
+            --master_addr=${MASTER_ADDR} \
+            --master_port=${MASTER_PORT} \
+            train.py \
+            --config /workspace/configs/train.yaml \
+            --output_dir /output
+        
+        # 资源配置
+        resources:
+          limits:
+            nvidia.com/gpu: 8
+            memory: 256Gi
+            cpu: "64"
+          requests:
+            nvidia.com/gpu: 8
+            memory: 128Gi
+            cpu: "32"
+        
+        # 环境变量
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: CUDA_VISIBLE_DEVICES
+          value: "0,1,2,3,4,5,6,7"
+        - name: NCCL_DEBUG
+          value: "INFO"
+        - name: NCCL_SOCKET_IFNAME
+          value: "eth0"
+        
+        # 环境变量（来自 Secret）
+        envFrom:
+        - secretRef:
+            name: training-secrets
+        
+        # 卷挂载
+        volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+        - name: data-volume
+          mountPath: /data
+          readOnly: true
+        - name: output-volume
+          mountPath: /output
+        - name: shm
+          mountPath: /dev/shm
+        - name: cache
+          mountPath: /root/.cache
+        
+        # 存活探针
+        livenessProbe:
+          exec:
+            command:
+            - python
+            - -c
+            - "import os; exit(0 if os.path.exists('/output/checkpoint') else 1)"
+          initialDelaySeconds: 300
+          periodSeconds: 60
+          timeoutSeconds: 10
+          failureThreshold: 5
+        
+        # 就绪探针
+        readinessProbe:
+          exec:
+            command:
+            - python
+            - -c
+            - "import torch; print(torch.cuda.is_available())"
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 10
+      
+      # 卷定义
+      volumes:
+      - name: workspace
+        persistentVolumeClaim:
+          claimName: workspace-pvc
+      - name: data-volume
+        persistentVolumeClaim:
+          claimName: training-data-pvc
+      - name: output-volume
+        persistentVolumeClaim:
+          claimName: training-output-pvc
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 64Gi
+      - name: cache
+        emptyDir: {}
+
+---
+# ==================== Headless Service ====================
+apiVersion: v1
+kind: Service
+metadata:
+  name: training-headless
+  namespace: ai-training
+spec:
+  clusterIP: None
+  selector:
+    app: training
+  ports:
+  - name: torch-dist
+    port: 29500
+    targetPort: 29500
+
+---
+# ==================== RBAC 配置 ====================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: training-sa
+  namespace: ai-training
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: training-role
+  namespace: ai-training
+rules:
+- apiGroups: [""]
+  resources: ["pods", "pods/status", "pods/log"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: training-rolebinding
+  namespace: ai-training
+subjects:
+- kind: ServiceAccount
+  name: training-sa
+  namespace: ai-training
+roleRef:
+  kind: Role
+  name: training-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# ==================== Secret ====================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: training-secrets
+  namespace: ai-training
+type: Opaque
+stringData:
+  WANDB_API_KEY: "your-wandb-key"
+  HUGGINGFACE_TOKEN: "your-hf-token"
+  AWS_ACCESS_KEY_ID: "your-aws-key"
+  AWS_SECRET_ACCESS_KEY: "your-aws-secret"
+
+---
+# ==================== Persistent Volume Claims ====================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: workspace-pvc
+  namespace: ai-training
+spec:
+  accessModes:
+  - ReadWriteMany
+  resources:
+    requests:
+      storage: 100Gi
+  storageClassName: nfs-storage
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: training-data-pvc
+  namespace: ai-training
+spec:
+  accessModes:
+  - ReadOnlyMany
+  resources:
+    requests:
+      storage: 1Ti
+  storageClassName: nfs-storage
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: training-output-pvc
+  namespace: ai-training
+spec:
+  accessModes:
+  - ReadWriteMany
+  resources:
+    requests:
+      storage: 500Gi
+  storageClassName: nfs-storage
