@@ -1,0 +1,351 @@
+# Kubernetes 推理服务部署配置
+# 高可用、自动扩缩容的推理服务
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inference-server
+  namespace: ai-inference
+  labels:
+    app: inference
+    version: v1
+spec:
+  # 副本数
+  replicas: 3
+  
+  # 选择器
+  selector:
+    matchLabels:
+      app: inference
+  
+  # 更新策略
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  
+  # Pod 模板
+  template:
+    metadata:
+      labels:
+        app: inference
+        version: v1
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8081"
+        prometheus.io/path: "/metrics"
+    
+    spec:
+      # 服务账户
+      serviceAccountName: inference-sa
+      
+      # 容忍度
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+      
+      # 节点选择器
+      nodeSelector:
+        node-type: gpu-inference
+      
+      # 亲和性
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - inference
+              topologyKey: kubernetes.io/hostname
+      
+      # Pod 安全上下文
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      
+      # 容器
+      containers:
+      - name: inference
+        image: ai-inference:v1.0
+        imagePullPolicy: Always
+        
+        # 端口
+        ports:
+        - name: http
+          containerPort: 8080
+          protocol: TCP
+        - name: metrics
+          containerPort: 8081
+          protocol: TCP
+        
+        # 资源配置
+        resources:
+          limits:
+            nvidia.com/gpu: 1
+            memory: 16Gi
+            cpu: "8"
+          requests:
+            nvidia.com/gpu: 1
+            memory: 8Gi
+            cpu: "4"
+        
+        # 环境变量
+        env:
+        - name: MODEL_NAME
+          value: "llama-7b"
+        - name: MODEL_PATH
+          value: "/app/models"
+        - name: BATCH_SIZE
+          value: "32"
+        - name: MAX_SEQUENCE_LENGTH
+          value: "2048"
+        - name: CUDA_VISIBLE_DEVICES
+          value: "0"
+        - name: OMP_NUM_THREADS
+          value: "4"
+        
+        # 从 ConfigMap 读取
+        envFrom:
+        - configMapRef:
+            name: inference-config
+        
+        # 从 Secret 读取
+        - secretRef:
+            name: inference-secrets
+        
+        # 卷挂载
+        volumeMounts:
+        - name: model-storage
+          mountPath: /app/models
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+        - name: shm
+          mountPath: /dev/shm
+        
+        # 存活探针
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+        
+        # 就绪探针
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: http
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        
+        # 启动探针
+        startupProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 30
+      
+      # 卷
+      volumes:
+      - name: model-storage
+        persistentVolumeClaim:
+          claimName: model-pvc
+      - name: tmp
+        emptyDir: {}
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 8Gi
+      
+      # 优雅终止
+      terminationGracePeriodSeconds: 60
+
+---
+# ==================== Service ====================
+apiVersion: v1
+kind: Service
+metadata:
+  name: inference-service
+  namespace: ai-inference
+  labels:
+    app: inference
+spec:
+  type: ClusterIP
+  selector:
+    app: inference
+  ports:
+  - name: http
+    port: 8080
+    targetPort: http
+  - name: metrics
+    port: 8081
+    targetPort: metrics
+
+---
+# ==================== Horizontal Pod Autoscaler ====================
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: inference-hpa
+  namespace: ai-inference
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: inference-server
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+  # CPU 利用率
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  # 内存利用率
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  # 自定义指标 (GPU 利用率)
+  - type: Pods
+    pods:
+      metric:
+        name: gpu_utilization
+      target:
+        type: AverageValue
+        averageValue: "70"
+  # 行为配置
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 10
+        periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 15
+      - type: Pods
+        value: 4
+        periodSeconds: 15
+      selectPolicy: Max
+
+---
+# ==================== Pod Disruption Budget ====================
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: inference-pdb
+  namespace: ai-inference
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: inference
+
+---
+# ==================== Ingress ====================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: inference-ingress
+  namespace: ai-inference
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  tls:
+  - hosts:
+    - api.example.com
+    secretName: inference-tls
+  rules:
+  - host: api.example.com
+    http:
+      paths:
+      - path: /v1
+        pathType: Prefix
+        backend:
+          service:
+            name: inference-service
+            port:
+              number: 8080
+
+---
+# ==================== ConfigMap ====================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: inference-config
+  namespace: ai-inference
+data:
+  LOG_LEVEL: "INFO"
+  PROMETHEUS_ENABLED: "true"
+  PROMETHEUS_PORT: "8081"
+  MAX_WORKERS: "4"
+  TIMEOUT_SECONDS: "300"
+  RATE_LIMIT: "1000"
+
+---
+# ==================== NetworkPolicy ====================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: inference-network-policy
+  namespace: ai-inference
+spec:
+  podSelector:
+    matchLabels:
+      app: inference
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: istio-system
+    - podSelector:
+        matchLabels:
+          app: nginx-ingress
+    ports:
+    - protocol: TCP
+      port: 8080
+  egress:
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: TCP
+      port: 443  # HTTPS
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: kube-system
+    ports:
+    - protocol: UDP
+      port: 53  # DNS
