@@ -1,0 +1,194 @@
+# Docker Compose 多服务编排配置
+# 用于本地开发和测试
+
+version: '3.8'
+
+services:
+  # ==================== 训练服务 ====================
+  training:
+    build:
+      context: .
+      dockerfile: Dockerfile.train
+    image: ai-training:latest
+    container_name: training
+    hostname: training
+    
+    # GPU 配置
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    
+    # 环境变量
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - CUDA_VISIBLE_DEVICES=0,1,2,3
+      - WANDB_API_KEY=${WANDB_API_KEY:-}
+      - MASTER_ADDR=training
+      - MASTER_PORT=29500
+      - WORLD_SIZE=4
+    
+    # 挂载卷
+    volumes:
+      - ./workspace:/workspace
+      - ./data:/data
+      - ./output:/output
+      - ./cache:/root/.cache
+    
+    # 网络
+    networks:
+      - ai-network
+    
+    # 启动命令
+    command: >
+      torchrun --nproc_per_node=4 train.py
+      --config configs/train.yaml
+      --output_dir /output
+
+  # ==================== 推理服务 ====================
+  inference:
+    build:
+      context: .
+      dockerfile: Dockerfile.inference
+    image: ai-inference:latest
+    container_name: inference
+    hostname: inference
+    
+    # GPU 配置
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    
+    # 端口映射
+    ports:
+      - "8080:8080"
+      - "8081:8081"  # Metrics
+    
+    # 环境变量
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=0
+      - MODEL_PATH=/app/models/model.pt
+      - BATCH_SIZE=32
+      - MAX_SEQUENCE_LENGTH=512
+    
+    # 挂载卷
+    volumes:
+      - ./models:/app/models
+    
+    # 网络
+    networks:
+      - ai-network
+    
+    # 健康检查
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    
+    # 依赖
+    depends_on:
+      - redis
+
+  # ==================== TensorBoard ====================
+  tensorboard:
+    image: tensorflow/tensorflow:latest
+    container_name: tensorboard
+    hostname: tensorboard
+    
+    ports:
+      - "6006:6006"
+    
+    volumes:
+      - ./output/logs:/logs
+    
+    command: tensorboard --logdir=/logs --host=0.0.0.0 --port=6006
+    
+    networks:
+      - ai-network
+
+  # ==================== Redis (缓存) ====================
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    hostname: redis
+    
+    ports:
+      - "6379:6379"
+    
+    volumes:
+      - redis-data:/data
+    
+    command: redis-server --appendonly yes
+    
+    networks:
+      - ai-network
+
+  # ==================== Prometheus (监控) ====================
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    hostname: prometheus
+    
+    ports:
+      - "9090:9090"
+    
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-lifecycle'
+    
+    networks:
+      - ai-network
+
+  # ==================== Grafana (可视化) ====================
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    hostname: grafana
+    
+    ports:
+      - "3000:3000"
+    
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    
+    volumes:
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+      - grafana-data:/var/lib/grafana
+    
+    networks:
+      - ai-network
+    
+    depends_on:
+      - prometheus
+
+# ==================== 网络配置 ====================
+networks:
+  ai-network:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.28.0.0/16
+
+# ==================== 数据卷 ====================
+volumes:
+  redis-data:
+  prometheus-data:
+  grafana-data:
